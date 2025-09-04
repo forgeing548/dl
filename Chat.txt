@@ -1,0 +1,247 @@
+-- CustomChatServer: region-safe custom chat with Roblox filtering, PMs, and anti-spam
+
+local Players = game:GetService("Players")
+local TextService = game:GetService("TextService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Remotes = ReplicatedStorage:WaitForChild("CustomChatRemotes")
+local ChatSend = Remotes:WaitForChild("ChatSend")          -- client -> server
+local ChatMessage = Remotes:WaitForChild("ChatMessage")    -- server -> clients
+local FetchHistory = Remotes:WaitForChild("FetchHistory")  -- client -> server
+
+-- Config
+local MAX_LEN = 250
+local HISTORY_LIMIT = 100
+local COOLDOWN_SEC = 1.0    -- 1 message per second
+local BURST_MAX = 6         -- at most 6 messages in 10 seconds
+local BURST_WINDOW = 10
+
+-- State
+local history = {}  -- array of {utc, fromUserId, fromName, text, kind="public"/"pm", toUserId?}
+local spamState = {} -- userId -> {lastTime, bucket, timestamps}
+
+local function pushHistory(entry)
+	table.insert(history, entry)
+	if #history > HISTORY_LIMIT then
+		table.remove(history, 1)
+	end
+end
+
+local function systemTo(plr, msg)
+	ChatMessage:FireClient(plr, {
+		kind = "system",
+		from = "System",
+		text = msg,
+		utc = os.time()
+	})
+end
+
+local function broadcast(entry, recipients) -- recipients: array<Player>
+	for _, target in ipairs(recipients) do
+		ChatMessage:FireClient(target, {
+			kind = entry.kind,
+			from = entry.fromName,
+			fromUserId = entry.fromUserId,
+			toUserId = entry.toUserId,
+			text = entry.text,
+			utc = entry.utc
+		})
+	end
+end
+
+local function getPlayerByPartial(name)
+	name = name:lower()
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p.Name:lower() == name or p.DisplayName:lower() == name then
+			return p
+		end
+	end
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p.Name:lower():find(name, 1, true) or p.DisplayName:lower():find(name, 1, true) then
+			return p
+		end
+	end
+	return nil
+end
+
+local function allowedToSend(userId)
+	local now = os.clock()
+	local s = spamState[userId]
+	if not s then
+		s = {lastTime = 0, timestamps = {}}
+		spamState[userId] = s
+	end
+
+	-- hard cooldown
+	if now - s.lastTime < COOLDOWN_SEC then
+		return false, "You're sending messages too fast."
+	end
+	s.lastTime = now
+
+	-- sliding window burst control
+	table.insert(s.timestamps, now)
+	-- prune
+	local i = 1
+	while i <= #s.timestamps do
+		if now - s.timestamps[i] > BURST_WINDOW then
+			table.remove(s.timestamps, i)
+		else
+			i += 1
+		end
+	end
+	if #s.timestamps > BURST_MAX then
+		return false, "You're sending too many messages."
+	end
+	return true
+end
+
+local function filterForRecipients(rawText, fromUserId, recipients)
+	-- Use Roblox filtering properly: per-recipient GetChatForUserAsync
+	local ok, result = pcall(function()
+		return TextService:FilterStringAsync(rawText, fromUserId)
+	end)
+	if not ok or not result then
+		return nil, "Filtering failed."
+	end
+
+	local filteredByUserId = {}
+	for _, plr in ipairs(recipients) do
+		local ok2, filtered = pcall(function()
+			return result:GetChatForUserAsync(plr.UserId)
+		end)
+		if ok2 and filtered then
+			filteredByUserId[plr.UserId] = filtered
+		else
+			filteredByUserId[plr.UserId] = "[message could not be displayed]"
+		end
+	end
+	return filteredByUserId
+end
+
+-- Handle /w <name> <msg> and /r <msg>
+local lastPMTarget = {} -- userId -> userId
+local function parseCommand(raw)
+	local target, msg
+
+	local wName, wMsg = raw:match("^/w%s+(%S+)%s+(.+)")
+	if wName and wMsg then
+		return "pmByName", wName, wMsg
+	end
+	local rMsg = raw:match("^/r%s+(.+)")
+	if rMsg then
+		return "reply", nil, rMsg
+	end
+	return nil
+end
+
+ChatSend.OnServerEvent:Connect(function(fromPlayer, rawText)
+	if typeof(rawText) ~= "string" then return end
+	rawText = rawText:gsub("%s+$",""):sub(1, MAX_LEN)
+	if rawText == "" then return end
+
+	local okSpam, reason = allowedToSend(fromPlayer.UserId)
+	if not okSpam then
+		systemTo(fromPlayer, reason)
+		return
+	end
+
+	-- Commands
+	local cmd, arg1, arg2 = parseCommand(rawText)
+	if cmd == "pmByName" or cmd == "reply" then
+		local targetPlayer
+		if cmd == "pmByName" then
+			targetPlayer = getPlayerByPartial(arg1)
+			if not targetPlayer then
+				systemTo(fromPlayer, "User not found.")
+				return
+			end
+			lastPMTarget[fromPlayer.UserId] = targetPlayer.UserId
+		else
+			local lastId = lastPMTarget[fromPlayer.UserId]
+			if not lastId then
+				systemTo(fromPlayer, "No one to reply to yet.")
+				return
+			end
+			targetPlayer = Players:GetPlayerByUserId(lastId)
+			if not targetPlayer then
+				systemTo(fromPlayer, "That player left.")
+				return
+			end
+		end
+
+		-- Filter for sender + target only
+		local recipients = {fromPlayer, targetPlayer}
+		local filteredMap, ferr = filterForRecipients(arg2 or "", fromPlayer.UserId, recipients)
+		if not filteredMap then
+			systemTo(fromPlayer, ferr or "Filter error.")
+			return
+		end
+
+		local utc = os.time()
+		-- send to each with their filtered text
+		for _, r in ipairs(recipients) do
+			local entry = {
+				kind = "pm",
+				fromName = fromPlayer.DisplayName,
+				fromUserId = fromPlayer.UserId,
+				toUserId = targetPlayer.UserId,
+				text = filteredMap[r.UserId] or "[message]",
+				utc = utc
+			}
+			broadcast(entry, {r})
+			-- only store sender-visible text in history (optional). Keep short history for PMs:
+			pushHistory({
+				utc = utc,
+				fromUserId = entry.fromUserId,
+				fromName = entry.fromName,
+				text = (r == fromPlayer) and entry.text or "[pm]",
+				kind = "pm",
+				toUserId = targetPlayer.UserId
+			})
+		end
+		return
+	end
+
+	-- Public chat
+	local recipients = Players:GetPlayers()
+	local filteredMap, ferr = filterForRecipients(rawText, fromPlayer.UserId, recipients)
+	if not filteredMap then
+		systemTo(fromPlayer, ferr or "Filter error.")
+		return
+	end
+
+	local utc = os.time()
+	-- Fire each client with its own filtered variant
+	for _, r in ipairs(recipients) do
+		local entry = {
+			kind = "public",
+			fromName = fromPlayer.DisplayName,
+			fromUserId = fromPlayer.UserId,
+			text = filteredMap[r.UserId] or "[message]",
+			utc = utc
+		}
+		broadcast(entry, {r})
+	end
+
+	-- Store a canonical copy (best-effort: the sender's filtered text)
+	pushHistory({
+		utc = utc,
+		fromUserId = fromPlayer.UserId,
+		fromName = fromPlayer.DisplayName,
+		text = filteredMap[fromPlayer.UserId] or "[message]",
+		kind = "public"
+	})
+end)
+
+FetchHistory.OnServerInvoke = function(plr)
+	-- Return shallow copy to avoid mutation
+	local copy = {}
+	for i = math.max(1, #history - HISTORY_LIMIT + 1), #history do
+		table.insert(copy, history[i])
+	end
+	return copy
+end
+
+Players.PlayerAdded:Connect(function(plr)
+	systemTo(plr, "Custom chat loaded. Use /w <name> <msg> for PM, /r <msg> to reply.")
+end)
