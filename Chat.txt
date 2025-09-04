@@ -13,7 +13,7 @@ local FetchHistory = Remotes:WaitForChild("FetchHistory")  -- client -> server
 local MAX_LEN = 250
 local HISTORY_LIMIT = 100
 local COOLDOWN_SEC = 1.0    -- 1 message per second
-local BURST_MAX = 6         -- at most 6 messages in 10 seconds
+local BURST_MAX = 7         -- at most 6 messages in 7 seconds
 local BURST_WINDOW = 10
 
 -- State
@@ -245,3 +245,4 @@ end
 Players.PlayerAdded:Connect(function(plr)
 	systemTo(plr, "Custom chat loaded. Use /w <name> <msg> for PM, /r <msg> to reply.")
 end)
+
